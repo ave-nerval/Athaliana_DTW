@@ -1,0 +1,1181 @@
+---
+title: "Analiza izražanja genov A. thaliana po tretiranju z jasmonsko kislino z metodo dinamičnega prilagajanja časa"
+subtitle: "Uvod v strojno učenje 2020/21"
+author: "Eva Lavrenčič"
+output: 
+  html_document:
+    number_sections: yes
+    toc: yes
+    toc_depth: 3
+    fig_caption: yes
+params:
+  printcode: yes
+  printresults: show
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F)
+library(readxl) # read excel files
+library(ggplot2) # plotting
+library(tidyr) # data preparation
+library(gplots) # plotting
+library(dplyr) # data preparation
+library(ggpubr) # combine plots
+library(here) # path file
+library(factoextra) # PCA
+library(RColorBrewer) # colour pallette
+library(dtw) # dynamic time warping
+library(NbClust) # clustering
+library(gprofiler2) # GO enrichment
+# library(plyr)
+library("org.At.tair.db", character.only = TRUE) # At annotation
+library(conflicted) # conflicts
+library(patchwork) # combine plots
+library(topGO) # gene ontology
+library(KEGGREST) # kegg pathways
+library(Rgraphviz) # GO visualization
+library(DT) # datatables
+conflict_prefer("select", "dplyr")
+conflict_prefer("slice", "dplyr")
+conflict_prefer("filter", "dplyr")
+#library(ggbiplot)
+load("res.RData")
+```
+
+# UVOD
+
+Namen projekta je bil ponovno analizirati podatke raziskovalcev iz Univerze v Utrechtu (Hickman in sod., 2017) o izražanju genov *Arabidopsis thaliana*, tretirane z jasmonsko kislino. Želeli smo analizirati trende izražanja genov v listih rastlin skozi čas ter poiskati morebitne vzorce in skupne značilnosti v izražanju genov, ki bi nam lahko pomagali pojasniti rastlinski obrambni odziv. Jasmonska kislina je fitohormon in je eden glavnih regulatorjev imunskega odziva rastlin za obrambo pred patogeni. Signalno omrežje jasmonske kisline koordinira sintezo različnih proteinov in sekundarnih metabolitov, udeleženih v obrambni odziv. Hickman in sod. (2017) so že pokazali, da tretiranje *A. thaliana* z MeJa sproži višjo transkripcijsko aktivnost ter identificirali transkripcijske faktorje, ki so udeleženi v bioloških obrambnih procesih.
+
+Podatki so vsebovali rezultate visokoločljivostne RNA-seq metode v 15 časovnih točkah tekom 16 ur po tretiranju listov rastlin z metil jasmonsko kislino (MeJa) za 33602 genov. Izvedli so po 4 biološke ponovitve za kontrolno in testno skupino.
+
+![Zasnova poskusa (časi meritev in število bioloških ponovitev).](exp_design.PNG)
+
+Primerjali smo časovne vrste izražanja diferencialno izraženih genov z metodo dinamičnega prileganja časa. Izračunali smo razdalje med pari časovnih vrst ter na podlagi matrike razdalj s aglomerativnim hierarhičnim razvrščanje po Wardovi metodi oblikovali skupine genov s podobnim profilom diferencialnega izražanja.
+
+# UVOZ PODATKOV
+
+## PODATKOVNI SET 1
+
+Median-count ratio normalized expression values of all genes and biological replicates for t = 0 h, and the 14 time points after MeJA and mock treatments. This sheet contains the median-count-ratio normalized expression values that have been rounded to one decimal for all genes and all conditions.
+
+```{r}
+# This sheet contains the median-count-ratio normalized expression values that have been rounded to one decimal for all genes and all conditions.
+# GeneID
+# measurements
+# 4 biological replicates
+expr_norm_wide <- read_excel("Hickman et al._2017_TPC2016-00958-LSBR2_Supplemental_Dataset_2_RAW.xlsx", sheet=2) # 33602x117
+
+# make long data
+expr_norm_long <- expr_norm_wide %>% 
+  pivot_longer(cols=2:117, names_to="treatment", values_to="counts") # 3897832       3
+```
+
+
+```{r}
+head(expr_norm_wide)
+```
+
+
+```{r}
+# dim(expr_norm_long)
+head(expr_norm_long)
+```
+
+**expr_norm_wide**
+- dimenzije 33602 x 117
+- stolpci: GeneID, 116 stolpcev za vsako meritev (14 časovnih točk * (4 kontrole + 4 testne) + 4 ob času $t_0$ = 116)
+
+**expr_norm_long**
+- dimenzije 3897832 x 3
+- stolpci: GeneID, treatment, counts -> vsaka kombinacija gena in meritve je zapisana v svoji vrstici
+
+Primer: MeJA_T0.5_3
+MeJA treated sample at time point 0, harvested 0.5 hours after treatment, biological replicate number 3.
+
+Primer: Mock_T0.25_1
+Kontrola, t = 0.25, biološka ponovitev = 1
+
+Primer: MeJA_T1_2
+Tretiranje, t = 1, biološka ponovitev = 2
+
+## PODATKOVNI SET 2
+
+Mean expression values for all genes across the time series following MeJA treatment: Average foldchange. This sheet contains the mean fold change (log2) for the comparison MeJA vs Mock for all genes and all time points.
+
+Gene, ki so bili signifikantno diferencialno izraženi glede na kontrolo, so identificirali s pomočjo posplošenega linearnega modela (log link funkcija in negativna binomska porazdelitev). Kot faktor so upoštevali čas, ki je pretekel po tretiranju in samo tretiranje.
+
+Polni model: total counts ~ treatment + time + treatment:time
+Reducirani model: total counts ~ time
+
+Primerjali so prileganje polnega in reduciranega modela (ANOVA, $\chi^2$ test). Dobljene vrednosti p so popravili z Bonferronijevim popravkom. Za nadaljno analizo so izbrali gene, ki so ustrezali naslednjim pogojem:
+- Vrednost p z Bonferronijevim popravkom < 0.05
+- Vsaj 2-kratna razlika v izražanju na vsak eni časovni točki
+- vsaj 10 odčitkov na vzorcu z najmanjšim izražanjem
+
+
+```{r}
+expr_change <- read_excel("Hickman et al._2017_TPC2016-00958-LSBR2_Supplemental_Dataset_3_DE.xlsx", sheet=2) # 33602x20
+
+expr_change_DEG <- expr_change[expr_change$DEG==1,]
+
+# dim(expr_change)
+# dim(expr_change_DEG)
+head(expr_change)
+```
+
+Imena stolpcev:
+- GeneID: 	The Arabidopsis TAIR10 gene AGI code.
+- T: 	Time point of harvesting in hours.
+- pval: 	The Generalized Linear Model P value for differential expression.
+- bfr.pval: 	The Bonferonni corrected P value.
+- DEG yes(1)/no(0): 	Gene is considered to be differentially expressed; 1 = yes, 0 = no.
+- Regulator? Yes(1)/no(0):	Gene is considered a transcriptional regulator; 1 = yes, 0 = no.
+
+**expr_change**
+- dimenzije 33602 x 20 -> testirali so izražanje 33602 genov
+
+**expr_change_DEG**
+- dimenzije 3611 x 20 -> 3611 genov je bilo statistično značilno diferencialno izraženih
+
+
+
+## PODATKOVNI SET 3
+
+```{r}
+# EXPERIMENTAL SETUP
+expr_setup <- read_excel("Hickman et al._2017_TPC2016-00958-LSBR2_Supplemental_Dataset_1_experimental-design.xlsx", sheet=2, skip=2) # 28x9
+head(expr_setup)
+
+# RNA-Seq
+expr_raw_reads <- read_excel("Hickman et al._2017_TPC2016-00958-LSBR2_Supplemental_Dataset_1_experimental-design.xlsx", sheet=3) # 116 x 19
+head(expr_raw_reads)
+```
+
+**expr_setup** (28x9)
+
+Time series experimental set-up and mRNA sequencing details.
+
+Harvesting schedule for the RNA-Seq timeseries. For each timepoint/treatment combination a total of 4 samples were used to prepare RNA-Seq libraries.
+
+Column-names:	
+- h / min: 	Number of hours / minutes that the sample was harvested after treatment.
+- A/B/T0: 	Sample abbreviation: A = Mock, B =  MeJA, T0 = immediately before any treatment. Number of biological replicates used for RNA-seq indicated.
+- Sample timepoint number: 	Sample number corresponding to the Xth time point.
+- Treatment: 	Time of the day that the sample was treated.
+- Harvest: 	Time of the day that the sample was harvested.
+- Time point chosen for RNA-Seq: 	Indication if the sample was chosen for one of the 15 time points that were sequenced.
+- Lights on/off: 	Indication when the lights in the growth chamber were switched on / off.
+
+**expr_raw_reads** (116 x 19)
+
+RNA-Seq
+
+```{r}
+head(expr_raw_reads)
+```
+
+
+This sheet contains the details about the individual RNA samples and how they were pooled for Illumina HiSeq2000 sequencing.
+
+Column-names:	
+- Sample: 	Sample name (as used for depositing in the SRA archive).  
+	Example for sample names: B05-2 = B, MeJA treatment. 05, Fifth time point, corresponding to 1h of treatment. 2, Second biological replicate out of 4.  
+- Flowcell: 	The flowcell in which the sample was sequenced (4 technical replicates).  
+- Lane: 	The lane in which the sample was sequenced (4 technical replicates).  
+- Number of raw reads: 	Total number of reads for each individual run.  
+- Total: 	Total nuber of reads per sample.  
+- Average per treatment (4 bio reps): 	Average number of reads per treatment (4 biological replicates).  
+
+
+# EKSPLORATORNA ANALIZA
+
+## SUROVI PODATKI
+
+Imamo 116 vzorcev. Najmanjše število meritev na vzorec je bilo `r summary(expr_raw_reads$RRTotal)["Min."]`, največje `r summary(expr_raw_reads$RRTotal)["Max"]`. Mediana znaša `r summary(expr_raw_reads$RRTotal)["Median"]`.
+
+```{r}
+summary(expr_raw_reads$RRTotal)
+```
+
+```{r}
+
+expr_plot1 <- ggplot(expr_raw_reads, aes(x=reorder(Sample, RRTotal, sum), y=RRTotal))+
+  geom_col() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size=5)) +
+  xlab("Vzorec") +
+  ylab("Število odčitkov") +
+  theme_bw()
+
+expr_plot2 <- ggplot(expr_raw_reads, aes(x=RRTotal)) +
+    geom_histogram(bins = 30) +
+    ylab("Frekvenca") +
+    xlab("Število odčitkov") +
+    theme_bw()
+  
+expr_plot3 <- expr_raw_reads %>% 
+  select(Sample, AveragePT) %>% 
+  drop_na() %>% 
+  ggplot(aes(x=reorder(Sample, AveragePT, sum), y=AveragePT))+
+    geom_col() +
+    xlab("Združeni vzorci") +
+    ylab("Povprečno tevilo odčitkov") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+expr_plot4 <- expr_raw_reads %>% 
+  select(AveragePT) %>% 
+  slice(seq(1,116,4)) %>% 
+  ggplot(aes(AveragePT)) +
+    geom_histogram() +
+    xlab("Povprečno število odčitkov") +
+    ylab("Frekvenca")  +
+    theme_bw()
+
+```
+
+
+```{r fig.cap="1) Število odčitkov glede na vzorec. 2) Porazdelitev števila odčitkov na vzorec. 3) Povprečno število odčitkov glede na vzorec. 4) Porazdelitev povprečnega števila odčitkov."}
+ggarrange(expr_plot1, expr_plot2, expr_plot3, expr_plot4)
+```
+
+
+
+## IZRAŽANJE GENOV
+
+### MEDIANA ODČITKOV
+
+Imamo podatke o izražanju 33602 genov za 15 časovnih točk. Meritve predstavljajo mediano normaliziranega števila prebranih transkriptov glede na gen in tretma v izbranih časovnih točkah. 4385 genov ni bilo izraženih v listih ob nobeni meritvi. Med izraženimi geni je bilo najmanjše število prebranih transkriptov 1, največje 144892589, prvi kvartil je znašal 154, mediana 23906 in tretji kvartil 1422820 odčitkov. Povprečje je bilo 219676 odčitkov. Porazdelitev je zelo asimetrična v desno (koeficient asimetričnosti 45.3), zato vrednosti logaritmiramo.
+
+```{r}
+expr_norm_wide$Total <- rowSums(expr_norm_wide[,2:117])
+sum(expr_norm_wide$Total==0)
+
+summary(expr_norm_wide$Total[expr_norm_wide$Total>0])
+
+e1071::skewness(expr_norm_wide$Total[expr_norm_wide$Total>0]) # pozitivna asimetricnost
+e1071::skewness(log10(expr_norm_wide$Total[expr_norm_wide$Total>0])) # negativna asimetricnost log10
+
+```
+
+```{r fig.cap="Porazdelitev Log10(normalized reads) za izražene gene"}
+expr_norm_wide %>% 
+  select(GeneID, Total) %>%
+  filter(Total>0) %>% 
+  ggplot(aes(log10(Total))) +
+    geom_histogram()
+
+```
+
+
+## DEG (DIFERENCIALNO IZRAŽANJE GENOV)
+
+```{r fig.cap="1) Porazdelitev vrednosti-p za diferencialno izražanje genov (Bonferonnijev popravek). 2) Število genov glede na diferencialno izraženost (0=ne, 1=da)."}
+deg_plot1 <- ggplot(expr_change, aes(x=bfr.pval)) +
+  geom_histogram()
+
+deg_plot2 <- ggplot(expr_change, aes(as.factor(DEG)))+
+  geom_bar() +
+  geom_text(stat='count', aes(label=..count..), vjust=-0.5) +
+  xlab("Diferencialno izražen gen") +
+  ylab("Frekvenca")
+
+
+ggarrange(deg_plot1, deg_plot2)
+```
+
+
+V vzorcu je `r sum(expr_change$DEG==1)` diferencialno izraženih genov.
+
+
+```{r}
+# DEG diferencialno izrazeni geni 3611
+expr_norm_wide_DEG <- expr_norm_wide[expr_change$DEG==1,]
+```
+
+
+
+
+### Primeri DEG (profil izražanja)
+
+Primeri profila izražanja genov za izbrane gene, udeležene v JA signalni poti.
+
+```{r}
+time_points <- c(0, 0.25, 0.5, 1, 1.5, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16)
+```
+
+```{r}
+# summarising data by groups
+data_summary <- function(data, varname, groupnames){
+  
+  summary_func <- function(x, col){
+    c(mean = mean(x[[col]], na.rm=TRUE),
+      sd = sd(x[[col]], na.rm=TRUE))
+  }
+  data_sum<-plyr::ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- plyr::rename(data_sum, c("mean" = varname))
+ return(data_sum)
+}
+```
+
+
+
+```{r}
+# visualizing expression profile
+fun_expr_profile <- function(gene){
+  expr <- expr_norm_wide[expr_change$GeneID==gene,]
+
+  # treatment
+  expr_2 <- expr[ , c(!grepl( "Mock|Total|GeneID" , names( expr ) ) )]
+  colnames(expr_2) <- rep(time_points, each=4)
+  expr_2 <- pivot_longer(expr_2, cols=1:15, names_to="time", values_to="counts", names_repair = "minimal")
+  # mock
+  expr_mock <- expr[ , c(!grepl( "MeJA|Total|GeneID" , names( expr ) ) )]
+  colnames(expr_mock) <- rep(time_points, each=4)
+  expr_mock <- pivot_longer(expr_mock, cols=1:15, names_to="time", values_to="counts", names_repair = "minimal")
+  
+  expr <- rbind(expr_2, expr_mock)
+  expr$time <- as.numeric(expr$time)
+  expr$treat <- rep(c("treatment", "mock"), each=60)
+  
+  df2 <- data_summary(expr, varname="counts", 
+                    groupnames=c("time", "treat"))
+
+
+  p<- ggplot(df2, aes(x=time, y=counts, group=treat, color=treat)) + 
+    geom_line() +
+    geom_point()+
+    geom_errorbar(aes(ymin=counts-sd, ymax=counts+sd), width=.2,
+                   position=position_dodge(0.05)) +
+    labs(title="Expression profile", x="Time", y = "Transcript abundance")+
+    theme_classic() +
+    scale_color_manual(values=c('#999999','#E69F00')) +
+    ggtitle(gene)
+
+  p # return plot
+}
+
+```
+
+
+```{r fig.cap="Examples of expression profiles of selected JA and SA pathwaymarker genes in our study; mean + SE"}
+# # # MYC2 AT1G32640
+# fun_expr_profile(gene = "AT1G32640")
+# # 
+# # # EDS1 AT3G48090
+# fun_expr_profile(gene = "AT3G48090")
+# # 
+# # 
+# # # BES1 AT1G19350
+# fun_expr_profile(gene = "AT1G19350")
+# # # JASMONATE-ZIM-DOMAIN PROTEIN 1 ATJAZ1
+# fun_expr_profile(gene = "AT1G19180")
+
+ggarrange(fun_expr_profile(gene = "AT1G32640"), fun_expr_profile(gene = "AT3G48090"), fun_expr_profile(gene = "AT1G19350"), fun_expr_profile(gene = "AT1G19180"), ncol=2, nrow=2)
+```
+
+MYC2 (AT1G32640) je transkripcijski faktor s tipično vezno domeno na DNA z osnovnim motivom levcinske zadrge vijačnica-zanka-vijačnica, ki je udeležen v signalne poti odziva na jasmonsko in abscizinsko kislino ter modro svetlobo. Negativno uravnava presnovo triptofana (Trp) in biosintezo sekundarnih metabolitov iz Trp. Pozitivno uravnava biosintezo flavonoidov, odpornost proti žuželkam in odziv na oksidativni stres. V tretiranih rastlinah je izražanje gena povišano.
+
+EDS1 (AT3G48090) regulira imunski odziv. Sproži zgodnjo obrambo rastlin in hipersenzitivni odziv neodvisno od PAD4, nato pa aktivira PAD4, ki okrepi obrambo rastlin s kopičenjem salicilne kisline.
+
+BES1 (AT1G19350) deluje kot aktivator SA-odvisnih obrambnih genov in zaviralec genov, reguliranih z JA. V tretiranih rastlinah je izražanje gena nižje.
+
+JAZ1 je protein iz jedra, ki sodeluje pri jasmonatni signalizalni poti. Raven transkripcije JAZ1 se dvigne kot odziv na jasmonsko kislino.
+
+
+
+# RAZVRŠČANJE V SKUPINE IN PCA (osnovni podatki)
+
+## Heatmap
+
+```{r fig.cap="Heatmap matrike podatkov, diferencialno izraženi geni (stolpci) in časovne točke (vrstice), razvrščeni glede na hierarhično razvrščanje. Skupaj razvrščene časovne točke: T0.25 in T0.5; T1, T1.5, T2 in T3; T12 in T16; T4, T5, T6, T7, T8 in T10."}
+mypalette<-brewer.pal(10,"RdBu")
+mypalette<-mypalette[10:1]
+
+heatmap(t((expr_change_DEG[,3:16])), col=mypalette, scale='none')
+```
+
+```{r}
+expr_change_DEG_long <- pivot_longer(data = expr_change_DEG, cols=2:16, names_to="time", names_prefix = "T", values_to="expr")
+```
+
+
+```{r fig.cap="Levo) Stevilo pozitvno/negativno diferencialno izrazenih genov glede na čas. Desno) Porazdelitev vrednosti log2 diferencialnega izražanja glede na čas"}
+p1 <- expr_change_DEG_long[expr_change_DEG_long$time!=0,] %>% group_by(time) %>%  
+  mutate(pos_regulated = sum(expr>0),
+         neg_regulated = sum(expr<0),
+         t.null= sum(expr==0)) %>% 
+  .[!duplicated(.$time),] %>% 
+  pivot_longer(., cols=c(t.null, neg_regulated, pos_regulated)) %>% 
+  ggplot(., aes(x = reorder(time, sort(as.numeric(time))), y=value, fill=name, group=name)) +
+    geom_col()
+
+
+p2 <- ggplot(expr_change_DEG_long[expr_change_DEG_long$time!=0,], aes(x = reorder(time, sort(as.numeric(time))), y = expr)) +
+  geom_bin2d(bins = 70) +
+  scale_fill_continuous(type = "viridis") +
+  theme_bw()
+
+(p1 + p2)
+
+```
+
+
+
+## Metoda glavnih komponent
+
+
+
+```{r}
+data_t <- t((expr_change_DEG[,3:16]))
+data_t <- data.frame(data_t)
+colnames(data_t) <- expr_change_DEG$GeneID
+```
+
+```{r}
+# heatmp correlation
+heatmap(cor(expr_change_DEG[,3:16]),symm=TRUE,col=mypalette)
+
+```
+
+
+```{r fig.cap="Metoda glavnih komponent: graf enot (časovne točke) in spremenljivk (geni). Prva komponenta pojasni 38.2 %, druga pa 21.1 % variabilnosti."}
+# cas 0 = izkljucen -> vse vrednosti 0
+
+deg_pca<-prcomp(data_t)
+
+
+fviz_pca_ind(deg_pca,
+             col.ind = "cos2", # Color by the quality of representation
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE     # Avoid text overlapping
+             )
+
+
+fviz_pca_var(deg_pca,
+             col.ind = "cos2", # Color by the quality of representation
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE     # Avoid text overlapping
+             )
+```
+
+
+
+# Iskanje terminov genske ontologije in metabolnih poti
+
+Projekt Gene Ontology (GO) je skupen projekt bioinformatske skupnosti, da bi razvili standardizirano skupno besedišče (termine genske ontologije) na področju genov in genskih produktov. Geni v podatkovni zbirki GO so opisani s skupnimi termini, ki opisujejo biološki proces, celično komponento in molekularno funkcijo gena oz. produkta gena. Izrazi so povezani z drugimi izrazi preko usmerjenega acikličnega grafa.
+
+Biološki proces je definiran kot prepoznavno zaporedje molekularnih dogodkov ali funkcij. Molekularna funkcija opisuje aktivnosti genskih produktov ali kompleksov na molekularnem nivoju. Celična komponenta opisuje lokacijo delovanja genskega produkta v celici.
+
+Uporabili smo Kolmogorov-Smirnov test za obogatitev terminov GO diferencialno izraženih genov *A. thaliana*. GO anotacije smo pridobili iz baze podatkov Bioconductor org.Atltair.db. Najprej smo ustvarili topGo objekt, ki vsebujejo ime genov in pripadajočo vrednost p za diferencialno izražanje, GO termine, asociirane z geni in izbrano ontologijo (biološki proces, molekularna funkcija, celična komponenta). topGo objekt uporabimo za analizo obogatitve terminov.
+
+KEGG (Kyoto Encyclopedia of Genes and Genomes) je enciklopedija genov in genomov, ki so jo leta 1995 ustvarili japonski raziskovalci iz Kjota. Vsebuje več podatkovnih zbirk, ki obravnavajo genome, biološke poti, bolezni in zdravila. Oznake za metabolne poti *A. thaliana* smo pridobili iz KEGGREST Bioconductor paketa in izvedli obogatitveno analizo.
+
+## Biološki proces
+
+```{r}
+# https://ucdavis-bioinformatics-training.github.io/2018-June-RNA-Seq-Workshop/friday/enrichment.html
+geneList <- expr_change$bfr.pval
+names(geneList) <- expr_change$GeneID
+```
+
+```{r eval = F}
+# Create topGOData object
+GOdata_bio <- new("topGOdata",
+    ontology = "BP",
+    allGenes = geneList,
+    geneSelectionFun = function(x)x,
+    annot = annFUN.org, mapping = "org.At.tair.db")
+```
+
+```{r}
+
+# The topGOdata object is then used as input for enrichment testing:
+
+resultKS <- runTest(GOdata_bio, algorithm = "weight01", statistic = "ks")
+
+tab_bio <- GenTable(GOdata_bio, raw.p.value = resultKS, topNodes = length(resultKS@score), numChar = 120)
+DT::datatable(tab_bio)
+
+```
+
+```{r fig.cap="Vizualizacija 3 najbolj signifikantnih bioloških procesov in njihovih starševskih procesov"}
+# slika
+par(cex = 0.5)
+showSigOfNodes(GOdata_bio, score(resultKS), firstSigNodes = 3, useInfo = "def")
+```
+
+```{r}
+par(cex = 1)
+```
+
+
+- Annotated: number of genes (in our gene list) that are annotated with the term
+- Significant: n/a for this example, same as Annotated here
+- Expected: n/a for this example, same as Annotated here
+- raw.p.value: P-value from Kolomogorov-Smirnov test that DE p-values annotated with the term are smaller (i.e. more significant) than those not annotated with the term.
+
+Kot smo pričakovali, DEG so bili udeleženi v bioloških procesih odziva na stres (odziv na rane, odziv na jasmonsko kislino, sinteza triptofana, odziv na hipoksijo).
+
+## Celična komponenta
+
+```{r eval = F}
+# Create topGOData object
+GOdata_cc <- new("topGOdata",
+    ontology = "CC",
+    allGenes = geneList,
+    geneSelectionFun = function(x)x,
+    annot = annFUN.org, mapping = "org.At.tair.db")
+
+```
+
+
+```{r}
+# The topGOdata object is then used as input for enrichment testing:
+
+resultKS <- runTest(GOdata_cc, algorithm = "weight01", statistic = "ks")
+
+
+tab_cc <- GenTable(GOdata_cc, raw.p.value = resultKS, topNodes = length(resultKS@score), numChar = 120)
+DT::datatable(tab_cc)
+```
+
+```{r fig.cap="Vizualizacija 3 najbolj signifikantnih celičnih komponent in njihovih starševskih komponent"}
+par(cex = 0.5)
+showSigOfNodes(GOdata_cc, score(resultKS), firstSigNodes = 3, useInfo = "def")
+par(cex = 1)
+```
+
+Obogateni procesi potekacjo predvsem v citosolu, jedru in v plazemski membrani.
+
+## Molekularna funkcija
+
+
+```{r}
+hush=function(code){
+  sink("NUL") # use /dev/null in UNIX
+  tmp = code
+  sink()
+  return(tmp)
+}
+
+```
+
+```{r eval = F}
+
+# Create topGOData object
+GOdata_mf <- new("topGOdata",
+    ontology = "MF",
+    allGenes = geneList,
+    geneSelectionFun = function(x)x,
+    annot = annFUN.org, mapping = "org.At.tair.db")
+
+```
+
+```{r}
+# The topGOdata object is then used as input for enrichment testing:
+
+hush(
+resultKS <- runTest(GOdata_mf, algorithm = "weight01", statistic = "ks"))
+
+invisible(
+resultKS <- runTest(GOdata_mf, algorithm = "weight01", statistic = "ks"))
+
+tab_mf <- GenTable(GOdata_mf, raw.p.value = resultKS, topNodes = length(resultKS@score), numChar = 120)
+DT::datatable(tab_mf)
+```
+
+```{r fig.cap="Vizualizacija 3 najbolj signifikantnih molekularnih funkcij in njihovih starševskih funkcij"}
+par(cex = 0.5)
+showSigOfNodes(GOdata_mf, score(resultKS), firstSigNodes = 3, useInfo = "def")
+par(cex = 1)
+```
+
+Obogatene molekularne funkcije so specifično vezanje na DNA (transkripcijski faktorji), aktivnost proteinske serin/treonin kinaze, aktivnost glutation transferaze.
+
+## KEGG obogatitvena analiza metabolnih poti (KEGGREST)
+
+```{r}
+# KEGG Pathway Enrichment Testing With KEGGREST
+pathways.list <- keggList("pathway", "ath")
+head(pathways.list)
+```
+
+```{r}
+# Pull all genes for each pathway
+pathway.codes <- sub("path:", "", names(pathways.list)) 
+genes.by.pathway <- sapply(pathway.codes,
+    function(pwid){
+        pw <- keggGet(pwid)
+        if (is.null(pw[[1]]$GENE)) return(NA)
+        pw2 <- pw[[1]]$GENE[c(TRUE,FALSE)] # may need to modify this to c(FALSE, TRUE) for other organisms
+        pw2 <- unlist(lapply(strsplit(pw2, split = ";", fixed = T), function(x)x[1]))
+        return(pw2)
+    }
+)
+
+```
+
+
+```{r}
+# Apply Wilcoxon rank-sum test to each pathway, testing if “in” p-values are smaller than “out” p-values
+pVals.by.pathway <- t(sapply(names(genes.by.pathway),
+    function(pathway) {
+        pathway.genes <- genes.by.pathway[[pathway]]
+        list.genes.in.pathway <- intersect(names(geneList), pathway.genes)
+        list.genes.not.in.pathway <- setdiff(names(geneList), list.genes.in.pathway)
+        scores.in.pathway <- geneList[list.genes.in.pathway]
+        scores.not.in.pathway <- geneList[list.genes.not.in.pathway]
+        if (length(scores.in.pathway) > 0){
+            p.value <- wilcox.test(scores.in.pathway, scores.not.in.pathway, alternative = "less")$p.value
+        } else{
+            p.value <- NA
+        }
+        return(c(p.value = p.value, Annotated = length(list.genes.in.pathway)))
+    }
+))
+
+# Assemble output table
+outdat <- data.frame(pathway.code = rownames(pVals.by.pathway))
+outdat$pathway.name <-pathways.list[paste0("path:",outdat$pathway.code)]
+outdat$p.value <- pVals.by.pathway[,"p.value"]
+outdat$Annotated <- pVals.by.pathway[,"Annotated"]
+outdat <- outdat[order(outdat$p.value),]
+DT::datatable(outdat)
+
+```
+
+Med najbolj obogatene metabolne poti sodijo prenos hormonskih signalov, biosinteza Phe, Tyr in Trp, biosinteza glukozinolata, metabolizem cisteina in metionina ter metabolizem alfa-linolejske kisline.
+
+
+# DINAMIČNO PRILAGAJANJE ČASA (ang. *dynamic time warping*, DTW)
+
+
+Metoda dinamično prileganje časa (DTW) se uporablja za računanje razdalje med časovnimi vrstami. Prednost metode je, da namesto absoletne razdalje, časovni vrsti primerja glede na trende. Algoritem po metodi dinamičnega programiranja (rezultat v dani celici je odvisen od prej izračunanih rezultatov) v vsakem koraku s pomočjo prejšnjih vrednosti najde trenutno optimalno vrednost. Metoda se lahko uporablja na različnih področjih, na primer za analizo prometa, signala EKG, razpoznavo glasu, pisave, hoje.
+
+Časovno vrsto predstavljajo meritve (časovne točke) v času. Podobnost med dvema časovnima vrstama lahko ocenimo z izračunom razdalje: manjša kot je razdalja med časovnima vrstama, bolj sta si podobni. Preprosta načina za izračun razdalje med dvema enako dolgima časovnima vrstama sta izračun evklidske ali manhattanske razdalje, vendar lahko tako tako analiziramo le razliko v časovnih vrstah med pari istočasnih točk, ne moremo pa opazovati trendov v podatkih.
+
+Zanima nas, ali lahko opazimo trende v izražanju genov. Npr., če se gen A začne povišano izražati ob času t in regulira izražanje gena B, nas zanima, ali se ob času t + tx spremeni izražanje gena B. V tem primeru je bolj primerna metoda DWT, saj lahko zaznamo trende tudi, ko obstaja zamik ali razlika v hitrosti med časovnima vrstama. Z metodo iščemo najbolj pogoste vzorce in močne korelacije. Definiramo matriko $M$ [$n x m$], kjer $n$ in $m$ predstavlja dolžino časovne vrste. Vsaka enota v matriki predstavlja razdaljo med dvema točkama časovnih vrst. Cenilna funkcija je definirana na podlagi poti po matriki. Metoda DTW išče najkrajšo pot po celicah matrike od celice (1,1) do celice (n,m). Algoritem lahko deluje v smeri naprej ali nazaj, smeri naprej-nazaj ali diagonalni smeri. Računska kompleksnost narašča s kvadratom dolžine daljše časovne vrste, zato je primernejša za krajše časovne vrste.
+
+
+![Primerjava časovnih vrst (modra in rdeča) z evklidsko razdaljo in DTW](Slike/dtw.jpg)
+
+![Matrika razdalj M in najboljše prileganje časovnih vrst](Slike/dtw2.png)
+
+![Matrika razdalj M](Slike/dtw3.png)
+
+
+Metoda kvalitativno dinamično prilagajanje časa (ang. *Qualitative Dynamic Time Warping*, QDTW) je kvalitativna aproksimacija metode DTW. Metoda kvantitativno časovno vrsto pretvori v kvalitativno. DTW se izračuna na novih kvalitativnih časovnih vrstah. Kvalitativne časovne vrste so navadno krajše, zato se zmanjša računski čas, obenem se nekoliko zmanjša napovedna točnost. V naših podatkih imamo 15 časovnih točk, tako da lahko uporabimo osnovni algoritem DTW.
+
+
+Načrt dela: Izračunamo parno DTW razdaljo med 3611 DEG.
+
+a) Poiščemo gene, ki imajo najmanjšo dtw razdaljo.
+b) Izvedemo hierarhično razvrščanje, saj imamo matriko razdalij. (agglomerative clustering with Ward linkage)
+c) Analiza clustrov - GO enrichment analysis
+
+
+```{r}
+### dtw
+expr_change_DEG_t <- expr_change_DEG[,2:16]
+gene_id <- expr_change_DEG$GeneID
+nDEG <- nrow(expr_change_DEG_t)
+# 3611*3611 = 13039321
+```
+
+
+```{r}
+# rezultati
+load("dtw_paired_dist.RData")
+load("dtw_paired_dist_dist.RData")
+
+# dm[1:5,1:5]
+# dmD[1:5]
+
+# spodnje trikotna; dtw ni simetricen !!!
+# multi_alignment <- dist(expr_change_DEG_t)
+
+# # NACIN 1
+# # asimetricno https://cran.r-project.org/web/packages/dtw/dtw.pdf
+# multi_alignment <- dtw::dist(expr_change_DEG_t, expr_change_DEG_t, method="DTW",step=asymmetric)
+# 
+# ## Symmetrize by averaging:
+multi_alignment_sim <- (multi_alignment+t(multi_alignment))/2
+multi_alignment_sim_dist <- proxy::as.dist(multi_alignment_sim)
+multi_alignment_sim_low <- multi_alignment_sim
+multi_alignment_sim_low[upper.tri(multi_alignment_sim_low)] <- NA
+# 
+# 
+# # NACIN 2
+# dm <- dtwDist(expr_change_DEG_t,step=asymmetric)
+# dmD <- as.dist(dm)
+
+```
+
+S funkcijo *dist* iz paketa *dtw* izračunamo parne dtw razdalje med časovnimi vrstami (diferencialno izražanje genov). Izračun razdalj po metodi dtw je asimetričen, zato zgornji in spodnji trikotni del matrike povprečimo, da dobimo simetrično matriko razdalij.
+
+
+
+```{r fig.cap="Porazdelitev razdalij med pari časovnih vrst, izračunanih po metodi dtw"}
+hist(multi_alignment_sim, freq=FALSE, main="", xlab="Razdalja med geni", ylab="Relativna frekvenca")
+```
+
+
+```{r}
+# pari genov z najmanjso razdaljo
+which((multi_alignment_sim) > 0 & (multi_alignment_sim < 0.7), arr.in=TRUE)
+```
+
+```{r}
+multi_alignment_sim[3082,642]
+
+gene_id[3082]
+gene_id[642]
+gene_id[1063]
+gene_id[995]
+gene_id[3186]
+gene_id[2402]
+```
+
+Najmanjša razdalja med pari časovnih vrst znaša 0,63, in sicer gre za razdaljo med genoma AT5G20600 (ribosomal RNA processing-like protein) in AT1G61730 (DNA-binding storekeeper protein-related transcriptional regulator), ki sta udeležena v procesu transkripcije. Povišano sta izražena glede na kontrolo predvsem v času 2-4 ure (velika transkripcijska aktivnost v celicah - prilagajanje na razmere). Razdalja, manjša od 0.7, je tudi med geni AT2G18240 (Rer1 family protein; sodeluje pri pridobivanju membranskih proteinov endoplazmatskega retikuluma iz zgodnjega Golgijevega aparata) in AT2G03440 (prepreči akumulacijo abscizinske kisline v celici; negativni regulator ABA signalne poti) ter AT5G36160 (cytosolic L-tyrosine aminotransferase) in AT4G15940 (Fumarylacetoacetate hydrolase homolog).
+
+V podatkovni bazi STRING, ki vsebuje podatke o omrežjih interakcij protein-protein, ni zapisov o interakcijah med zgornjimi proteini.
+
+![V podatkovni bazi STRING ni zapisov o proteinskih interakcijah med produkti genov AT5G20600 in AT1G61730.](String1.PNG)
+
+![Interakcije produkta gena AT5G20600 z drugimi proteini.](String2.PNG)
+
+![Interakcije produkta gena AT1G61730 z drugimi proteini.](String3.PNG)
+
+
+```{r}
+# plot: expr change skozi čas
+fun_DEG <- function(gene, timePoints = time_points){
+  expr <- data.frame("exprChange" = t(expr_change_DEG[expr_change_DEG$GeneID==gene, 2:16]))
+  expr$time <- timePoints
+
+
+  p<- ggplot(expr, aes(x=time, y=exprChange)) + 
+    geom_line() +
+    geom_point() +
+    labs(title="Expression profile", x="Time", y = "log2change") +
+    theme_classic() +
+    scale_color_manual(values=c('#999999','#E69F00')) +
+    ggtitle(gene)
+
+  p
+}
+
+```
+
+
+```{r eval=F}
+# https://www.arabidopsis.org/index.jsp
+
+fun_expr_profile(gene_id[3082]) # ribosomal RNA processing-like protein AT5G20600
+
+fun_expr_profile(gene_id[642]) # DNA-binding storekeeper protein-related transcriptional regulator AT1G61730
+
+fun_expr_profile(gene_id[3186]) # cytosolic L-tyrosine aminotransferase AT5G36160
+
+fun_expr_profile(gene_id[2402]) # Fumarylacetoacetate hydrolase homolog AT4G15940
+
+fun_expr_profile(gene_id[1063]) # Rer1 family protein AT2G18240
+
+fun_expr_profile(gene_id[995]) # Induced at the transcriptional level by Pseudomonas syringae pv. tomato infection AT2G03440
+
+```
+
+```{r fig.cap="Profili izražanja genov"}
+ggarrange(fun_expr_profile(gene_id[3082]), fun_expr_profile(gene_id[642]), fun_expr_profile(gene_id[3186]), fun_expr_profile(gene_id[2402]), fun_expr_profile(gene_id[1063]), fun_expr_profile(gene_id[995]), nrow=3, ncol=2)
+```
+
+
+```{r fig.cap="Sprememba izražanja skozi čas (najbolj podobni profili izražanja)"}
+ggarrange(fun_DEG(gene_id[3082]),fun_DEG(gene_id[642]), fun_DEG(gene_id[3186]), fun_DEG(gene_id[2402]), fun_DEG(gene_id[1063]), fun_DEG(gene_id[995]), ncol=2, nrow=3)
+```
+
+# Hierarhično razvrščanje
+
+Da bi identificirali skupine genov s podobnim profilom izražanja, uporabimo metodo hierarhičnega aglomerativnega razvrščanja.
+
+Pri hierarhičnem razvrščanju razvrstimo enote v skupine glede na to, kako podobne so si med sabo. Uporabimo lahko minimalno, maksimalno, povprečno metodo ali Wardovo metodo. Izvedli bomo Wardovo metodo, pri kateri želimo minimalizirati vrednost Wardove kriterijske funkcije.
+
+
+```{r}
+# uporabimo wardovo metodo
+ward <- fastcluster::hclust(d = dmD, method = "ward.D")
+plot(ward, hang = -1, main = "Ward\n(Wardova metoda)", ylab = "razdalja", xlab = "enote")
+
+# uporabimo McQuittyjevo metodo ("povprecna" povzeanost)
+average <- fastcluster::hclust(d = dmD, method = "mcquitty")
+plot(average, hang = -1, main = "mcquitty\n(povprecna metoda)", ylab = "razdalja", xlab = "enote")
+```
+
+
+
+```{r}
+# exp_change_norm <- BBmisc::normalize(expr_change_DEG_t, method="standardize")
+# clusters <- dtwclust::tsclust(series = exp_change_norm, type = "hierarchical", k = 2L:30L, distance = "dtw_basic")
+```
+
+
+Optimalno število skupin (Cindex) = 13. Uporabimo še število skupin 27 (članek) in 100 (veliko število skupin).
+
+```{r}
+nrClustersCindex <- NbClust(diss = dmD, distance = NULL, min.nc = 2, max.nc = 30, method="ward.D", index = "cindex")
+
+nrClustersCindex$Best.nc
+
+```
+
+```{r}
+# Cut tree into k groups
+sub_grp13 <- cutree(ward, k = 13)
+sub_grp27 <- cutree(ward, k = 27)
+sub_grp100 <- cutree(ward, k = 100)
+
+# Number of members in each cluster
+## sub_grp13
+##  1   2   3   4   5   6   7   8   9  10  11  12  13 
+##  149 324 571 426 188 517 110 415 221 350  99 165  76 
+```
+
+```{r fig.cap="Porazdelitev števila genov po skupinah. Število skupin: 13, 27, 100."}
+
+par(mfrow=c(1,3))
+barplot(table(sub_grp13), xlab="Skupina",ylab="Število", main="k = 13")
+barplot(table(sub_grp27), xlab="Skupina",ylab="Število", main="k = 27")
+barplot(table(sub_grp100), xlab="Skupina",ylab="Število", main="k = 100")
+
+```
+
+```{r}
+expr_change_DEG_t$skupina13 <- sub_grp13
+expr_change_DEG$skupina13 <- sub_grp13
+
+expr_change_DEG_t$skupina27 <- sub_grp27
+expr_change_DEG$skupina27 <- sub_grp27
+
+expr_change_DEG_t$skupina100 <- sub_grp100
+expr_change_DEG$skupina100 <- sub_grp100
+
+expr_change_DEG_long <- pivot_longer(data = expr_change_DEG, cols=2:16, names_to="time", names_prefix = "T", values_to="expr")
+
+```
+
+```{r fig.cap="Dendrogram z označenimi skupinami (k=13)"}
+plot(ward, cex = 0.6)
+rect.hclust(ward, k = 13, border = 2:14)
+```
+
+
+```{r fig.cap="log2 DE skozi čas glede na skupine, k = 13", fig.height=20}
+ggplot(expr_change_DEG_long, aes(x = as.numeric(time), y = expr)) +
+  geom_line(aes(color = GeneID)) +
+  facet_grid(vars(skupina13)) +
+  theme(legend.position = "none")
+```
+
+```{r fig.cap="The mean gene expression profile for each cluster, with red and blue indicating upregulation and downregulation of expression (log2-fold change [MeJA/mock]), respectively. k = 13, 27, 100"}
+p1 <- ggplot(expr_change_DEG_long, aes(x = reorder(time, sort(as.numeric(time))), y = as.factor(skupina13), fill = expr)) + 
+    geom_raster() +
+    scale_fill_gradientn(colours=c("#0000FFFF","#FFFFFFFF","#FF0000FF")) +
+    xlab("Čas") + ylab("Skupina") +
+    ggtitle("k = 13")
+
+p2 <- ggplot(expr_change_DEG_long, aes(x = reorder(time, sort(as.numeric(time))), y = as.factor(skupina27), fill = expr)) + 
+    geom_raster() +
+    scale_fill_gradientn(colours=c("#0000FFFF","#FFFFFFFF","#FF0000FF")) +
+    xlab("Čas") + ylab("Skupina") +
+    ggtitle("k = 27")
+
+p3 <- ggplot(expr_change_DEG_long, aes(x = reorder(time, sort(as.numeric(time))), y = as.factor(skupina100), fill = expr)) + 
+    geom_raster() +
+    scale_fill_gradientn(colours=c("#0000FFFF","#FFFFFFFF","#FF0000FF")) +
+    xlab("Čas") + ylab("Skupina") +
+    ggtitle("k = 100")
+
+
+
+((p1 / p2 + plot_layout(guides = 'auto')) | p3) + plot_layout(guides = 'collect')
+
+```
+
+
+
+
+## Analiza skupin: Gene Set Enrichment Analysis with ClusterProfiler
+
+```{r}
+# BiocManager::install("clusterProfiler")
+# BiocManager::install("pathview")
+# BiocManager::install("enrichplot")
+```
+
+```{r eval=F, echo=F}
+organism = "org.At.tair.db"
+BiocManager::install(organism, character.only = TRUE)
+library("org.At.tair.db", character.only = TRUE)
+```
+
+Funkcija 'gost' iz paketa 'gprofiler2' omogoča funkcionalno obogatitev seznama genov z orodjem Profiler. Kot vhodne argumente vnesemo seznam genov, ki nas zanimajo, organizem ter dodatne argumente. Pred analizo moramo TAIR ID oznake genov pretvoriti v ENTREZ ID oznake (paket AnnotationDbi, funkcija select).
+
+
+```{r}
+# map ENTREZIDs to gene symbols and TAIR IDs
+# store six Entrez IDs
+my_key <- keys(org.At.tair.db, keytype="ENTREZID")
+head(my_key)
+# columns to return
+my_col <- c('SYMBOL', 'TAIR')
+# query!
+ids <- AnnotationDbi::select(org.At.tair.db, keys=my_key, columns=my_col, keytype="ENTREZID")
+colnames(ids) <- c("ENTREZID", "SYMBOL", "GeneID")
+
+gene_id_df <- data.frame("GeneID" = gene_id)
+gene_id_df <- base::merge(gene_id_df, ids, all.x = T, by = "GeneID")
+gene_id_df <- gene_id_df[!duplicated(gene_id_df$GeneID), ]
+gene_id_df <- base::merge(gene_id_df, expr_change_DEG[,c("GeneID", "skupina13", "skupina100", "bfr.pval")])
+gene_id_df <- gene_id_df[,c("GeneID", "ENTREZID", "skupina13", "skupina100", "bfr.pval")]
+gene_id_df <- na.omit(gene_id_df)
+head(gene_id_df)
+```
+
+Funkcionalno obogatitev izvedemo za vsako izmed 13 skupin.
+
+
+```{r}
+# https://cran.r-project.org/web/packages/gprofiler2/vignettes/gprofiler2.html
+plotList <- NULL
+
+nCluster <- 13
+for (i in 1:nCluster){
+  plotList[[i]] <- gost(query = gene_id_df$ENTREZID[gene_id_df$skupina13==i], organism="athaliana", multi_query = FALSE)
+
+}
+
+gostplot(plotList[[1]], capped = TRUE, interactive = TRUE)
+gostplot(plotList[[2]], capped = TRUE, interactive = TRUE)
+gostplot(plotList[[3]], capped = TRUE, interactive = TRUE)
+gostplot(plotList[[4]], capped = TRUE, interactive = TRUE)
+gostplot(plotList[[5]], capped = TRUE, interactive = TRUE)
+gostplot(plotList[[6]], capped = TRUE, interactive = TRUE)
+gostplot(plotList[[7]], capped = TRUE, interactive = TRUE)
+gostplot(plotList[[8]], capped = TRUE, interactive = TRUE)
+gostplot(plotList[[9]], capped = TRUE, interactive = TRUE)
+gostplot(plotList[[10]], capped = TRUE, interactive = TRUE)
+gostplot(plotList[[11]], capped = TRUE, interactive = TRUE)
+gostplot(plotList[[12]], capped = TRUE, interactive = TRUE)
+gostplot(plotList[[13]], capped = TRUE, interactive = TRUE)
+
+
+
+```
+
+```{r}
+p <- NULL
+nCluster <- 13
+
+function_dt <- function(grouped_data, nCluster){
+  for(i in 1:nCluster){
+    p[[i]] <- cbind(grouped_data[[i]]$result[,c("term_id", "source", "term_name", "p_value")], "skupina"=i)
+  }
+  p
+}
+
+p <- function_dt(plotList, 13)
+p <- do.call(rbind.data.frame, p)
+
+
+datatable(p, caption = "Signifikantno obogateni GO termini in KEGG poti")
+
+```
+
+
+## Funkcionalna obogatitev s topGO
+
+```{r eval = F}
+nCluster <- 13
+listBP <- NULL
+
+head(gene_id_df)
+geneList <- gene_id_df$bfr.pval
+names(geneList) <- gene_id_df$GeneID
+
+
+for (i in 1:nCluster){
+
+  GOdata <- new("topGOdata",
+      ontology = "BP",
+      allGenes = geneList[gene_id_df$skupina13==i],
+      geneSelectionFun = function(x)x,
+      annot = annFUN.org, mapping = "org.At.tair.db")
+  
+  resultKS <- runTest(GOdata, algorithm = "weight01", statistic = "ks")
+  tab <- GenTable(GOdata, raw.p.value = resultKS, topNodes = length(resultKS@score), numChar = 120)
+  listBP[[i]] <- tab
+
+}
+
+
+```
+
+```{r eval = F}
+# extract significant biological processes
+listSig <- NULL
+
+for (i in 1:nCluster){
+  listSig[[i]] <- listBP[[i]][listBP[[i]]$raw.p.value<0.05,]
+  
+}
+
+df <- do.call(rbind, listSig)
+df$clusterNr <- rep(1:nCluster, times=sapply(listSig, nrow))
+df <- df[order(df$raw.p.value),]
+```
+
+```{r}
+DT::datatable(df, caption = "Signifikantni biološki procesi po GO obogatitvi")
+
+
+```
+
+
+
+## Obogatitve KEGG poti
+
+```{r}
+
+keggCl <- NULL
+
+for (i in 1:nCluster){
+
+  # Apply Wilcoxon rank-sum test to each pathway, testing if “in” p-values are smaller than “out” p-values
+  pVals.by.pathway <- t(sapply(names(genes.by.pathway),
+      function(pathway) {
+          pathway.genes <- genes.by.pathway[[pathway]]
+          list.genes.in.pathway <- intersect(names(geneList[gene_id_df$skupina13==i]), pathway.genes)
+          list.genes.not.in.pathway <- setdiff(names(geneList[gene_id_df$skupina13==i]), list.genes.in.pathway)
+          scores.in.pathway <- geneList[gene_id_df$skupina13==i][list.genes.in.pathway]
+          scores.not.in.pathway <- geneList[gene_id_df$skupina13==i][list.genes.not.in.pathway]
+          if (length(scores.in.pathway) > 0){
+              p.value <- wilcox.test(scores.in.pathway, scores.not.in.pathway, alternative = "less")$p.value
+          } else{
+              p.value <- NA
+          }
+          return(c(p.value = p.value, Annotated = length(list.genes.in.pathway)))
+      }
+  ))
+  
+  outdat <- data.frame(pathway.code = rownames(pVals.by.pathway))
+  outdat$pathway.name <-pathways.list[paste0("path:",outdat$pathway.code)]
+  outdat$p.value <- pVals.by.pathway[,"p.value"]
+  outdat$Annotated <- pVals.by.pathway[,"Annotated"]
+  outdat <- outdat[order(outdat$p.value),]
+  keggCl[[i]] <- outdat
+
+}
+
+
+listKegg <- NULL
+
+for (i in 1:nCluster){
+  listKegg[[i]] <- na.omit(keggCl[[i]])
+  listKegg[[i]] <- listKegg[[i]][listKegg[[i]]$p.value<0.05,]
+
+}
+
+dfKegg <- do.call(rbind, listKegg)
+dfKegg$clusterNr <- rep(1:nCluster, times=sapply(listKegg, nrow))
+dfKegg <- dfKegg[order(dfKegg$p.value),]
+
+DT::datatable(dfKegg, caption = "Signifikantne KEGG poti po obogatitvi")
+```
+
+Signifikantne KEGG poti po obogatitavi najdemo v skupinah 4, 6 in 8 (največje skupine!). Obogatene poti so na področju sinteze aminokislin, metabolizma dušika in žvepla (fiziološke poti).
+
+
+
+
+```{r fig.cap="DEG profil genov iz skupin 4, 6 in 8 (k = 13)."}
+p1 <- ggplot(expr_change_DEG_long[expr_change_DEG_long$skupina13==4,], aes(x = as.numeric(time), y = expr)) +
+  geom_line(aes(color = GeneID)) +
+  facet_grid(vars(skupina13)) +
+  theme(legend.position = "none")
+
+p2 <- ggplot(expr_change_DEG_long[expr_change_DEG_long$skupina13==6,], aes(x = as.numeric(time), y = expr)) +
+  geom_line(aes(color = GeneID)) +
+  facet_grid(vars(skupina13)) +
+  theme(legend.position = "none")
+
+p3 <- ggplot(expr_change_DEG_long[expr_change_DEG_long$skupina13==8,], aes(x = as.numeric(time), y = expr)) +
+  geom_line(aes(color = GeneID)) +
+  facet_grid(vars(skupina13)) +
+  theme(legend.position = "none")
+
+(p1 / p2 / p3)
+
+```
+
+
+```{r eval = F, fig.cap="The mean gene expression profile for each cluster, with red and blue indicating upregulation and downregulation of expression (log2-fold change [MeJA/mock]), respectively; clusters 4, 6 and 8 (k = 13)"}
+ggplot(expr_change_DEG_long[expr_change_DEG_long$skupina13 %in% c(4, 6, 8),], aes(x = time, y = as.factor(skupina13), fill = expr)) + 
+    geom_raster() +
+    scale_fill_gradientn(colours=c("#0000FFFF","#FFFFFFFF","#FF0000FF"))
+```
+
+
+
+```{r}
+# izvozimo podatke za STRING analizo
+x <- expr_change_DEG$GeneID[expr_change_DEG$skupina100==90]
+data.table::fwrite(list(x), file = "test_fwrite.txt")
+```
+
+
+
+![Primer: STRING analiza (k = 100, cluster = 90)](String_k100_c90.png)
+
+```{r fig.cap="DEG expression profile (k=100, cluster=90)"}
+ggplot(expr_change_DEG_long[expr_change_DEG_long$skupina100==90,], aes(x = as.numeric(time), y = expr)) +
+  geom_line(aes(color = GeneID)) +
+  facet_grid(vars(skupina100)) +
+  theme(legend.position = "none") +
+  xlab("Čas") + ylab("Diferencialno izražanje (log2)")
+```
+
+
+
+
+ZAKLJUČEK
+
+Analizirali smo podatke izražanja genov *A. thaliana* po tretiranju z jasmonsko kislino. Diferencialno izražene gene smo razvrstili v skupine glede na profil DEG in poiskali njihov biološki pomen. Zanimivo bi bilo primerjati rezultate z analizo na drugih rastlinah (npr. krompir - nisem dobila podatkov) ter poiskati biološke vzroke za opažene pojave.
+
+
+
+
+
+VIRI
+
+Cooke, E. J., Savage, R. S., Kirk, P. D., Darkins, R., & Wild, D. L. (2011). Bayesian hierarchical clustering for microarray time series data with replicates and outlier measurements. BMC Bioinformatics, 12(1), 399. https://doi.org/10.1186/1471-2105-12-399
+
+Gene Ontology and KEGG Enrichment Analysis. (n.d.). Retrieved September 17, 2021, from https://ucdavis-bioinformatics-training.github.io/2018-June-RNA-Seq-Workshop/friday/enrichment.html
+
+Kianimajd, A., Ruano, M. G., Carvalho, P., Henriques, J., Rocha, T., Paredes, S., & Ruano, A. E. (2017). Comparison of different methods of measuring similarity in physiologic time series. IFAC-PapersOnLine, 50(1), 11005–11010. https://doi.org/10.1016/j.ifacol.2017.08.2479
+
+Kljun, M., & Tersek, M. (n.d.). A review and comparison of time series similarity measures. 4. https://erk.fe.uni-lj.si/2020/papers/kljun(a_review).pdf
+
+Network functions and visualization. (n.d.). Retrieved September 17, 2021, from http://cytoscape.org/RCy3/articles/Network-functions-and-visualization.html
+
+
+Strle, B., Mozina, M., & Bratko, I. (2009). Qualitative approximation to Dynamic Time Warping similarity between time series data. https://www.semanticscholar.org/paper/Qualitative-approximation-to-Dynamic-Time-Warping-Strle-Mozina/989ef11b328d3f0a143a678fae0a946f09d364b0
+
+
+
+
+
+
+
